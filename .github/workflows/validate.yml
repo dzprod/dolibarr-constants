@@ -1,0 +1,120 @@
+name: Validate & Index
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'constants/**.json'
+  pull_request:
+    paths:
+      - 'constants/**.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate JSON files
+        run: |
+          python3 - <<'EOF'
+          import json, sys, os, glob
+
+          errors = []
+          files  = sorted(glob.glob("constants/*.json"))
+
+          if not files:
+              print("No JSON files found in constants/")
+              sys.exit(0)
+
+          required_fields = {"name", "inferred_type", "default_value",
+                             "module", "description", "description_source",
+                             "occurrences"}
+
+          for path in files:
+              print(f"Checking {path}...")
+              try:
+                  with open(path) as f:
+                      data = json.load(f)
+              except json.JSONDecodeError as e:
+                  errors.append(f"{path}: invalid JSON — {e}")
+                  continue
+
+              if "constants" not in data:
+                  errors.append(f"{path}: missing top-level 'constants' key")
+                  continue
+
+              for name, c in data["constants"].items():
+                  missing = required_fields - set(c.keys())
+                  if missing:
+                      errors.append(f"{path} > {name}: missing fields {missing}")
+
+                  src = c.get("description_source")
+                  allowed = {None, "wiki", "ia_generated", "human_reviewed"}
+                  if src not in allowed:
+                      errors.append(f"{path} > {name}: invalid description_source '{src}'")
+
+          if errors:
+              print("\n❌ Validation errors:")
+              for e in errors:
+                  print(f"  {e}")
+              sys.exit(1)
+          else:
+              print(f"\n✅ {len(files)} file(s) valid")
+          EOF
+
+  update-index:
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update versions.json
+        run: |
+          python3 - <<'EOF'
+          import json, glob, os
+          from datetime import date
+
+          files = sorted(glob.glob("constants/*.json"))
+          versions = []
+
+          for path in files:
+              version = os.path.basename(path).replace(".json", "")
+              with open(path) as f:
+                  data = json.load(f)
+              stats = data.get("stats", {})
+              versions.append({
+                  "version":          version,
+                  "file":             f"constants/{version}.json",
+                  "generated_at":     data.get("generated_at"),
+                  "unique_constants": stats.get("unique_constants", 0),
+                  "active":           stats.get("active", 0),
+                  "enriched":         stats.get("enriched", 0),
+              })
+
+          index = {
+              "updated_at":  str(date.today()),
+              "maintainer":  "DZProd <https://dzprod.net>",
+              "repository":  "https://github.com/${{ github.repository }}",
+              "versions":    versions,
+          }
+
+          with open("versions.json", "w") as f:
+              json.dump(index, f, indent=2, ensure_ascii=False)
+
+          print(f"✅ versions.json updated — {len(versions)} version(s)")
+          EOF
+
+      - name: Commit versions.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git diff --cached --quiet || git commit -m "chore: update versions.json index [skip ci]"
+          git push
